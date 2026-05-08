@@ -26,7 +26,7 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeout = 10000) {
 
     try {
 
-      const res = await fetchWithRetry(url, {
+      const res = await fetch(url, {
         ...options,
         signal: controller.signal,
       });
