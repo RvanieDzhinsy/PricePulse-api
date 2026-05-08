@@ -13,6 +13,56 @@ const DISTR_TYPE    = "7";
 app.use(cors());
 app.use(express.json());
 
+
+async function fetchWithRetry(url, options = {}, retries = 3, timeout = 10000) {
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+
+    const controller = new AbortController();
+
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, timeout);
+
+    try {
+
+      const res = await fetchWithRetry(url, {
+        ...options,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timer);
+
+      if ([403, 429, 500, 502, 503].includes(res.status)) {
+
+        console.log(`Попытка ${attempt}: статус ${res.status}`);
+
+        if (attempt === retries) {
+          throw new Error(`Сервер вернул ${res.status}`);
+        }
+
+        await new Promise(r => setTimeout(r, 1500 * attempt));
+
+        continue;
+      }
+
+      return res;
+
+    } catch (e) {
+
+      clearTimeout(timer);
+
+      console.log(`Ошибка попытки ${attempt}:`, e.message);
+
+      if (attempt === retries) {
+        throw e;
+      }
+
+      await new Promise(r => setTimeout(r, 1500 * attempt));
+    }
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  GET /search?source=wb&article=225308444
 //  GET /search?source=ozon&article=123456789
@@ -76,26 +126,47 @@ app.get("/", (req, res) => res.json({ status: "ok", service: "PricePulse API" })
 //  WB: открытый API, работает без ключа
 // ═══════════════════════════════════════════════════════════════
 async function fetchWB(nm) {
-  const url = `https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&nm=${nm}`;
-  const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) throw new Error(`WB API вернул ${res.status}`);
+  const url = `https://search.wb.ru/exactmatch/ru/common/v4/search?query=${nm}&resultset=catalog&limit=1`;
 
-  const json    = await res.json();
+  const res = await fetchWithRetry(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "application/json",
+      "Referer": "https://www.wildberries.ru/",
+      "Origin": "https://www.wildberries.ru"
+    }
+  });
+
+  if (!res.ok) {
+    throw new Error(`WB API вернул ${res.status}`);
+  }
+
+  const json = await res.json();
+
   const product = json?.data?.products?.[0];
-  if (!product)  throw new Error("Товар не найден на Wildberries");
 
-  const brand   = product.brand || "";
-  const name    = product.name  || "";
-  const fullName = brand ? `${brand} ${name}` : name;
-  const price   = product.salePriceU ? Math.round(product.salePriceU / 100) : null;
+  if (!product) {
+    throw new Error("Товар не найден на WB");
+  }
 
-  // WB CDN картинка
-  const vol  = Math.floor(nm / 100000);
-  const part = Math.floor(nm / 1000);
-  const pad  = String(vol).padStart(2, "0");
-  const imageUrl = `https://basket-${pad}.wbbasket.ru/vol${vol}/part${part}/${nm}/images/c246x328/1.webp`;
+  const fullName =
+    `${product.brand || ""} ${product.name || ""}`.trim();
 
-  return { productName: fullName, priceSource: price, imageUrl };
+  const price =
+    product.salePriceU
+      ? Math.round(product.salePriceU / 100)
+      : null;
+
+  const imageUrl =
+    product.image
+      ? `https://images.wbstatic.net/c246x328/${product.image}`
+      : null;
+
+  return {
+    productName: fullName,
+    priceSource: price,
+    imageUrl
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -104,113 +175,44 @@ async function fetchWB(nm) {
 // ═══════════════════════════════════════════════════════════════
 async function fetchOzon(sku) {
 
-  // ── Метод 1: API v1 item info (наиболее стабильный) ──────────
-  try {
-    const url = `https://www.ozon.ru/api/entrypoint-api.bff/v1/page/json?url=%2Fproduct%2F${sku}%2F&layout_container=pdpPage2column&layout_page_index=2`;
-    const res = await fetch(url, {
-      redirect: "manual",   // не следим за редиректами — берём что есть
-      headers: {
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept":          "application/json",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer":         `https://www.ozon.ru/product/${sku}/`,
-        "x-o3-app-name":   "ozon-frontend",
-        "x-o3-app-version":"2.0",
-      },
-    });
+  const searchUrl =
+    `https://www.ozon.ru/search/?text=${sku}`;
 
-    if (res.status === 200) {
-      const json    = await res.json();
-      const widgets = json?.widgetStates || {};
-
-      // Ищем виджеты с заголовком товара
-      for (const key of Object.keys(widgets)) {
-        if (key.startsWith("webProductHeading") || key.startsWith("pdpHeading")) {
-          try {
-            const data  = JSON.parse(widgets[key]);
-            const name  = data?.title || data?.name || data?.productName;
-            const price = data?.price?.price
-              ? parseInt(String(data.price.price).replace(/\D/g, ""))
-              : null;
-            if (name) {
-              console.log(`[Ozon] Метод 1 успешен: ${name}`);
-              return { productName: name, priceSource: price, imageUrl: null };
-            }
-          } catch {}
-        }
-      }
+  const res = await fetchWithRetry(searchUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
+      "Accept-Language": "ru-RU,ru;q=0.9",
     }
-  } catch (e) {
-    console.log("[Ozon] Метод 1 не сработал:", e.message);
+  });
+
+  const html = await res.text();
+
+  // Ищем title страницы
+  const titleMatch =
+    html.match(/<title>(.*?)<\/title>/i);
+
+  if (!titleMatch) {
+    throw new Error("Ozon не вернул название товара");
   }
 
-  // ── Метод 2: WB-подобный открытый эндпоинт Ozon ──────────────
-  try {
-    const url = `https://api.ozon.ru/composer-api.bff/page/json/v2?url=/product/${sku}/`;
-    const res = await fetch(url, {
-      redirect: "manual",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept":     "application/json",
-      },
-    });
+  let title = titleMatch[1];
 
-    if (res.status === 200) {
-      const json    = await res.json();
-      const widgets = json?.widgetStates || {};
-      for (const key of Object.keys(widgets)) {
-        if (key.startsWith("webProductHeading")) {
-          try {
-            const data = JSON.parse(widgets[key]);
-            const name = data?.title || data?.name;
-            if (name) {
-              console.log(`[Ozon] Метод 2 успешен: ${name}`);
-              return { productName: name, priceSource: null, imageUrl: null };
-            }
-          } catch {}
-        }
-      }
-    }
-  } catch (e) {
-    console.log("[Ozon] Метод 2 не сработал:", e.message);
+  title = title
+    .replace(" — купить в интернет-магазине OZON", "")
+    .replace(" – OZON", "")
+    .trim();
+
+  if (!title || /^\d+$/.test(title)) {
+    throw new Error("Товар Ozon не найден");
   }
 
-  // ── Метод 3: Поисковый запрос Ozon по артикулу ───────────────
-  try {
-    const url = `https://www.ozon.ru/api/composer-api.bff/web/v1/search?text=${sku}&layout_container=categorySearchMegapagination&layout_page_index=1`;
-    const res = await fetch(url, {
-      redirect: "manual",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept":     "application/json",
-        "Referer":    "https://www.ozon.ru/",
-      },
-    });
-
-    if (res.status === 200) {
-      const json  = await res.json();
-      const items = json?.searchResultsV2 || json?.items || [];
-      const first = Array.isArray(items) ? items[0] : null;
-      if (first?.name || first?.title) {
-        const name = first.name || first.title;
-        console.log(`[Ozon] Метод 3 успешен: ${name}`);
-        return { productName: name, priceSource: null, imageUrl: null };
-      }
-    }
-  } catch (e) {
-    console.log("[Ozon] Метод 3 не сработал:", e.message);
-  }
-
-  // ── Фолбэк: артикул как поисковый запрос на Маркете ──────────
-  // Яндекс Маркет хорошо ищет по артикулам Ozon — часто находит тот же товар
-  console.log(`[Ozon] Все методы не сработали, используем артикул ${sku} как поисковый запрос`);
   return {
-    productName: sku,   // ищем по самому артикулу — Маркет часто находит
+    productName: title,
     priceSource: null,
-    imageUrl:    null,
+    imageUrl: null
   };
 }
-
 // ═══════════════════════════════════════════════════════════════
 //  ЯНДЕКС МАРКЕТ: поиск по названию через публичный API
 //  Приоритет — товары с реферальной программой (cashback=true)
@@ -231,7 +233,7 @@ async function searchYandexMarket(query) {
   const searchUrl = `https://market.yandex.ru/api/search?text=${encodeURIComponent(cleanQuery)}&numdoc=5&pp=18&clid=${MARKET_CLID}`;
 
   try {
-    const res = await fetch(searchUrl, {
+    const res = await fetchWithRetry(searchUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Accept":     "application/json, text/plain, */*",
