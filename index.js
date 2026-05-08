@@ -99,38 +99,113 @@ async function fetchWB(nm) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  OZON: их API закрыт, парсим публичную страницу товара
-//  (работает без ключа, но менее надёжно)
+//  OZON: используем их внутренний API v1 с нужными куками
+//  Ozon блокирует редиректы — запрашиваем напрямую с redirect:manual
 // ═══════════════════════════════════════════════════════════════
 async function fetchOzon(sku) {
-  // Пробуем получить метаданные через мобильный API Ozon
-  const url = `https://www.ozon.ru/api/composer-api.bff/page/json/v2?url=/product/${sku}/`;
-  const res  = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
-      "Accept":     "application/json",
-    },
-  });
 
-  if (res.ok) {
-    try {
-      const json = await res.json();
-      // Ищем название в структуре страницы
+  // ── Метод 1: API v1 item info (наиболее стабильный) ──────────
+  try {
+    const url = `https://www.ozon.ru/api/entrypoint-api.bff/v1/page/json?url=%2Fproduct%2F${sku}%2F&layout_container=pdpPage2column&layout_page_index=2`;
+    const res = await fetch(url, {
+      redirect: "manual",   // не следим за редиректами — берём что есть
+      headers: {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept":          "application/json",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Referer":         `https://www.ozon.ru/product/${sku}/`,
+        "x-o3-app-name":   "ozon-frontend",
+        "x-o3-app-version":"2.0",
+      },
+    });
+
+    if (res.status === 200) {
+      const json    = await res.json();
+      const widgets = json?.widgetStates || {};
+
+      // Ищем виджеты с заголовком товара
+      for (const key of Object.keys(widgets)) {
+        if (key.startsWith("webProductHeading") || key.startsWith("pdpHeading")) {
+          try {
+            const data  = JSON.parse(widgets[key]);
+            const name  = data?.title || data?.name || data?.productName;
+            const price = data?.price?.price
+              ? parseInt(String(data.price.price).replace(/\D/g, ""))
+              : null;
+            if (name) {
+              console.log(`[Ozon] Метод 1 успешен: ${name}`);
+              return { productName: name, priceSource: price, imageUrl: null };
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch (e) {
+    console.log("[Ozon] Метод 1 не сработал:", e.message);
+  }
+
+  // ── Метод 2: WB-подобный открытый эндпоинт Ozon ──────────────
+  try {
+    const url = `https://api.ozon.ru/composer-api.bff/page/json/v2?url=/product/${sku}/`;
+    const res = await fetch(url, {
+      redirect: "manual",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept":     "application/json",
+      },
+    });
+
+    if (res.status === 200) {
+      const json    = await res.json();
       const widgets = json?.widgetStates || {};
       for (const key of Object.keys(widgets)) {
         if (key.startsWith("webProductHeading")) {
-          const data = JSON.parse(widgets[key]);
-          const name  = data?.title || data?.name;
-          const price = data?.price?.price ? parseInt(data.price.price.replace(/\D/g,"")) : null;
-          if (name) return { productName: name, priceSource: price, imageUrl: null };
+          try {
+            const data = JSON.parse(widgets[key]);
+            const name = data?.title || data?.name;
+            if (name) {
+              console.log(`[Ozon] Метод 2 успешен: ${name}`);
+              return { productName: name, priceSource: null, imageUrl: null };
+            }
+          } catch {}
         }
       }
-    } catch {}
+    }
+  } catch (e) {
+    console.log("[Ozon] Метод 2 не сработал:", e.message);
   }
 
-  // Фолбэк: возвращаем артикул как поисковый запрос
+  // ── Метод 3: Поисковый запрос Ozon по артикулу ───────────────
+  try {
+    const url = `https://www.ozon.ru/api/composer-api.bff/web/v1/search?text=${sku}&layout_container=categorySearchMegapagination&layout_page_index=1`;
+    const res = await fetch(url, {
+      redirect: "manual",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept":     "application/json",
+        "Referer":    "https://www.ozon.ru/",
+      },
+    });
+
+    if (res.status === 200) {
+      const json  = await res.json();
+      const items = json?.searchResultsV2 || json?.items || [];
+      const first = Array.isArray(items) ? items[0] : null;
+      if (first?.name || first?.title) {
+        const name = first.name || first.title;
+        console.log(`[Ozon] Метод 3 успешен: ${name}`);
+        return { productName: name, priceSource: null, imageUrl: null };
+      }
+    }
+  } catch (e) {
+    console.log("[Ozon] Метод 3 не сработал:", e.message);
+  }
+
+  // ── Фолбэк: артикул как поисковый запрос на Маркете ──────────
+  // Яндекс Маркет хорошо ищет по артикулам Ozon — часто находит тот же товар
+  console.log(`[Ozon] Все методы не сработали, используем артикул ${sku} как поисковый запрос`);
   return {
-    productName: `Ozon артикул ${sku}`,
+    productName: sku,   // ищем по самому артикулу — Маркет часто находит
     priceSource: null,
     imageUrl:    null,
   };
