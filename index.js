@@ -14,35 +14,23 @@ app.use(cors());
 app.use(express.json());
 
 
-async function fetchWithRetry(url, options = {}, retries = 3, timeout = 10000) {
+async function fetchWithRetry(url, options = {}, retries = 3) {
 
   for (let attempt = 1; attempt <= retries; attempt++) {
 
-    const controller = new AbortController();
-
-    const timer = setTimeout(() => {
-      controller.abort();
-    }, timeout);
-
     try {
 
-      const res = await fetch(url, {
-        ...options,
-        signal: controller.signal,
-      });
-
-      clearTimeout(timer);
+      const res = await fetch(url, options);
 
       if ([403, 429, 500, 502, 503].includes(res.status)) {
 
         console.log(`Попытка ${attempt}: статус ${res.status}`);
 
         if (attempt === retries) {
-          throw new Error(`Сервер вернул ${res.status}`);
+          return res;
         }
 
-        await new Promise(r => setTimeout(r, 1500 * attempt));
-
+        await new Promise(r => setTimeout(r, 2000));
         continue;
       }
 
@@ -50,15 +38,13 @@ async function fetchWithRetry(url, options = {}, retries = 3, timeout = 10000) {
 
     } catch (e) {
 
-      clearTimeout(timer);
-
-      console.log(`Ошибка попытки ${attempt}:`, e.message);
+      console.log("FETCH ERROR:", e.message);
 
       if (attempt === retries) {
         throw e;
       }
 
-      await new Promise(r => setTimeout(r, 1500 * attempt));
+      await new Promise(r => setTimeout(r, 2000));
     }
   }
 }
